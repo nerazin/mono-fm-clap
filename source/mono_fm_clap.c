@@ -24,8 +24,8 @@
 #include "mono_fm.h"
 
 /* The machine's eight knobs, then the AMP page's. */
-enum { SYN, TUNE = SYN + 7, ATK = 8, HOLD, DEC, REL, VOL, PAN, NPARAM };
-static const int amp_word[6] = {MF_ATK, MF_HOLD, MF_DEC, MF_REL, MF_VOL, MF_PAN};
+enum { SYN, TUNE = SYN + 7, ATK = 8, HOLD, DEC, REL, VOL, PAN, PORT, NPARAM };
+static const int amp_word[7] = {MF_ATK, MF_HOLD, MF_DEC, MF_REL, MF_VOL, MF_PAN, MF_PORT};
 #define FILTER_LEVEL 0x3905a5   /* 0.4455: the track filter's level at its defaults, without its inversion */
 
 typedef struct {
@@ -45,14 +45,14 @@ static const Machine machines[MF_MACHINES] = {
     {"1 Frequency", "1 Freq Envelope", "1 Volume", "1 Vol Envelope", "2 Frequency", "2 Envelope", "2 Feedback", "Tune"},
     {64, 64, 64, 64, 74, 80, 30, 64}, 0x80},
 };
-static const char *const amp_label[6] = {"Attack", "Hold", "Decay", "Release", "Volume", "Pan"};
-static const double amp_def[6] = {0, 0, 64, 64, 64, 64};
+static const char *const amp_label[7] = {"Attack", "Hold", "Decay", "Release", "Volume", "Pan", "Portamento"};
+static const double amp_def[7] = {0, 0, 64, 64, 64, 64, 0};
 
 static const char *const features[] = {
    CLAP_PLUGIN_FEATURE_INSTRUMENT, CLAP_PLUGIN_FEATURE_SYNTHESIZER, CLAP_PLUGIN_FEATURE_STEREO, NULL
 };
 #define DESCRIPTOR(m, text) { .clap_version = CLAP_VERSION_INIT, .id = machines[m].id, .name = machines[m].name, \
-   .vendor = "Independent DSP", .url = "", .manual_url = "", .support_url = "", .version = "0.1.0", \
+   .vendor = "Independent DSP", .url = "", .manual_url = "", .support_url = "", .version = "0.2.0", \
    .description = text, .features = features }
 static const clap_plugin_descriptor_t descriptors[MF_MACHINES] = {
    DESCRIPTOR(MF_STAT, "The Monomachine FM+ STAT machine and AMP envelope, ported from its DSP code"),
@@ -132,7 +132,7 @@ typedef struct {
    bool active, direct, settled;
    uint32_t latency, blocks;
    int pos;
-   int32_t knob[NPARAM], syn[8], amp[8], pitch_word, tick_recip;
+   int32_t knob[NPARAM], syn[8], amp[8], pitch_word, tick;
    int trig_word;                     /* block word 40 for the next block */
    double tempo;
    /* notes: the keys held, in the order pressed; the note sounding; the frame's news (1 on, 2 off) */
@@ -149,8 +149,8 @@ static uint64_t to_bits(double x) { uint64_t u; memcpy(&u, &x, sizeof u); return
 static double value(const Plugin *s, int id) { return bits_to(atomic_load_explicit(&s->value[id], memory_order_relaxed)); }
 static void set_value(Plugin *s, int id, double x) { atomic_store_explicit(&s->value[id], to_bits(x), memory_order_relaxed); }
 
-/* Block word 35 for a tempo, as the CPU sends it: 0x800000 / (24 x BPM), the tempo kept to 30..300. */
-static int32_t tick_recip(double bpm) { return 0x800000 / (int32_t)clamp(lround(24.0 * bpm), 720, 7200); }
+/* Block word 42 for a tempo, as the CPU sends it: 24 x BPM, the tempo kept to 30..300 (word 35 is 0x800000 / it). */
+static int32_t tick_of(double bpm) { return (int32_t)clamp(lround(24.0 * bpm), 720, 7200); }
 
 /* Start of a control frame (three blocks): the words the main CPU sends. */
 static void control_frame(Plugin *s) {
@@ -163,7 +163,7 @@ static void control_frame(Plugin *s) {
       if (p < 8) s->syn[p] = word; else s->amp[amp_word[p - 8]] = word;
    }
    s->pitch_word = (s->note << 11) / 12;   /* the note word */
-   s->tick_recip = tick_recip(s->tempo);
+   s->tick = tick_of(s->tempo);
    s->trig_word = s->pending == 1 ? 0x81 : s->pending == 2 ? 0x02 : 0;
    s->pending = 0;
    if (!s->settled) {   /* the machine's assignment: its init and trig routines, the glide at the note, the AMP idle */
@@ -182,8 +182,8 @@ static void native_frame(Plugin *s, double out[2]) {
       if (s->blocks % 3 == 0) control_frame(s);
       s->blocks++;
       int32_t m[MF_FRAMES], g[2][MF_FRAMES];
-      mf_block(&s->core, s->syn, mf_pitch(&s->glide, s->pitch_word, s->syn[7]), s->trig_word & 0x80, m);
-      mf_amp(&s->env, s->trig_word & 0x7f, s->amp, s->tick_recip, g);
+      mf_block(&s->core, s->syn, mf_pitch(&s->glide, s->pitch_word, s->syn[7], s->amp[MF_PORT], s->tick), s->trig_word & 0x80, m);
+      mf_amp(&s->env, s->trig_word & 0x7f, s->amp, 0x800000 / s->tick, g);
       s->trig_word = 0;
       for (int c = 0; c < 2; ++c)
          for (int i = 0; i < MF_FRAMES; ++i) s->out[c][i] = mf_apply(g[c][i], mf_mpy(m[i], FILTER_LEVEL)) / 8388608.0;
@@ -386,7 +386,7 @@ static bool state_save(const clap_plugin_t *p, const clap_ostream_t *st) {
    const Plugin *s = p->plugin_data;
    uint8_t buf[8 + 8 * NPARAM] = {0};
    memcpy(buf, machines[s->machine].magic, 4);
-   buf[7] = 1;
+   buf[7] = 2;
    for (int i = 0; i < NPARAM; ++i)
       for (int b = 0; b < 8; ++b) buf[8 + 8 * i + b] = (uint8_t)(to_bits(value(s, i)) >> (8 * b));
    for (uint64_t done = 0; done < sizeof buf;) {
@@ -399,14 +399,19 @@ static bool state_save(const clap_plugin_t *p, const clap_ostream_t *st) {
 static bool state_load(const clap_plugin_t *p, const clap_istream_t *st) {
    Plugin *s = p->plugin_data;
    uint8_t buf[8 + 8 * NPARAM];
-   for (uint64_t done = 0; done < sizeof buf;) {
-      const int64_t n = st && st->read ? st->read(st, buf + done, sizeof buf - done) : -1;
+   uint64_t size = 8;
+   for (uint64_t done = 0; done < size;) {
+      const int64_t n = st && st->read ? st->read(st, buf + done, size - done) : -1;
       if (n <= 0) return false;
       done += (uint64_t)n;
+      if (done == 8 && size == 8) {   /* the header: version 1 had no PORT */
+         if (memcmp(buf, machines[s->machine].magic, 4) || buf[4] || buf[5] || buf[6] || buf[7] < 1 || buf[7] > 2) return false;
+         size = 8 + 8 * (uint64_t)(buf[7] == 1 ? PORT : NPARAM);
+      }
    }
-   if (memcmp(buf, machines[s->machine].magic, 4) || buf[4] || buf[5] || buf[6] || buf[7] != 1) return false;
    double v[NPARAM];
-   for (int i = 0; i < NPARAM; ++i) {
+   v[PORT] = def_of(s->machine, PORT);
+   for (int i = 0; i < (int)(size - 8) / 8; ++i) {
       uint64_t u = 0;
       for (int b = 0; b < 8; ++b) u |= (uint64_t)buf[8 + 8 * i + b] << (8 * b);
       v[i] = bits_to(u);
@@ -427,7 +432,7 @@ static bool remote_get(const clap_plugin_t *p, uint32_t i, clap_remote_controls_
    snprintf(page->section_name, sizeof page->section_name, "%s", machines[s->machine].name);
    snprintf(page->page_name, sizeof page->page_name, "%s", i ? "Amp" : "Machine");
    page->page_id = i;
-   for (int k = 0; k < CLAP_REMOTE_CONTROLS_COUNT; ++k) page->param_ids[k] = i == 0 ? (clap_id)k : k < 6 ? (clap_id)(ATK + k) : CLAP_INVALID_ID;
+   for (int k = 0; k < CLAP_REMOTE_CONTROLS_COUNT; ++k) page->param_ids[k] = i == 0 ? (clap_id)k : k < 7 ? (clap_id)(ATK + k) : CLAP_INVALID_ID;
    return true;
 }
 static const clap_plugin_remote_controls_t remote = {remote_count, remote_get};

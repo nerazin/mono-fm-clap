@@ -16,8 +16,8 @@ Monomachine track is.
 
 ## Controls
 
-Every plug-in has the machine's eight knobs (page "Machine") and six of the
-AMP page's (page "Amp"). All are 0–127 like the unit's knobs, can be
+Every plug-in has the machine's eight knobs (page "Machine") and seven of
+the AMP page's (page "Amp"). All are 0–127 like the unit's knobs, can be
 automated and modulated in Bitwig, and default to the unit's values.
 
 The operators in all three machines are sines whose frequency is a ratio to
@@ -64,6 +64,7 @@ The Amp page, in all three:
 | Release   | REL  | The fall after the note ends, with the same times. |
 | Volume    | VOL  | The level, (VOL/128)². |
 | Pan       | PAN  | Equal-power panning (−64 to +63 on the display). In the centre the left side is 0.11 dB lower than the right, as on the unit. |
+| Portamento | PORT | The glide to a new note, in beats of the host's tempo, whatever the interval: 0 is instant, 32 about 1/30 beat, 64 a third of a beat, 96 three beats, 127 about 27 beats (2^(13 Portamento/128)/276 beats). |
 
 The Monomachine's envelope has no sustain: the level falls with Decay even
 while the note is held (use Decay 127 to hold it), and a note's end starts
@@ -82,9 +83,14 @@ This is what the firmware does; the plug-in keeps all of it.
   phase increment (FM). The carrier is then halved in rate by two stages of
   allpass pairs. The output is mono.
 - **Notes.** Each note restarts the machine's envelopes (1ENV, 2ENV, 3ENV,
-  1FEN, 1VEN) and the AMP envelope's attack, from where its level is. The pitch reaches a new note in two
-  16-sample blocks (the portamento at 0). A4 is 439.80 Hz, 0.8 cents under
-  440 Hz, as the firmware tunes it.
+  1FEN, 1VEN) and the AMP envelope's attack, from where its level is. With
+  Portamento at 0 the pitch reaches a new note in two 16-sample blocks.
+  Above 0 it glides in a straight line (in pitch), covering the interval
+  from the glide's start in the Portamento time. A note that comes mid-glide
+  in the same direction keeps that start; one in the other direction turns
+  from where the pitch is, at the speed for the interval from the note it
+  was heading to.
+  A4 is 439.80 Hz, 0.8 cents under 440 Hz, as the firmware tunes it.
 - **Knobs.** Parameter changes reach the machine the way the Monomachine's
   CPU sends a knob: every 384 samples the value moves a quarter of the way to
   where you set it. Modulation is added on top, unsmoothed, every 48
@@ -103,8 +109,8 @@ This is what the firmware does; the plug-in keeps all of it.
   on an FM+ track at the default FILT page, the filter passes the machine at
   0.42 to 0.45 of its level depending on the note, and shapes it slightly
   (up to 0.8 dB around 800 Hz, with a roll-off at the top).
-- **The rest of the track.** EQ, delay, the LFOs, portamento and the track's
-  LEVEL are not in the plug-in. Bitwig's own modulators can take the LFOs'
+- **The rest of the track.** EQ, delay, the LFOs and the track's LEVEL are
+  not in the plug-in. Bitwig's own modulators can take the LFOs'
   place.
 - **Notes.** One voice: the newest note held sounds. Releasing it returns to
   the previous note still held, with a new trig; releasing the last ends the
@@ -134,8 +140,8 @@ opened in Bitwig as part of this work.
 
 | Check | Result |
 |-------|--------|
-| Core vs. firmware, for each machine on a synth track: random notes on and off, knob moves through the CPU model, raw control words anywhere from 0 to $7FFFFF (also for the AMP page and the trig word), tempos from 30 to 300 BPM; 400,000 blocks each | every machine output sample identical; every machine state word identical after every block; the AMP envelope's state, its gain ramps and its products with the firmware's own filter output identical in every block; the pitch index (glide and TUNE) and the frequency word identical to the kernel's in every block |
-| Built plug-in code vs. firmware, with the firmware's filter output replaced by the machine's output × 0.4455 as in the plug-in: knob moves on both pages through the CPU model, modulation, overlapping notes, tempo changes (240,000 blocks per plug-in: 23,874 moves, 2,389 of them modulation; 6,031 notes on and 4,674 off) | every output sample identical |
+| Core vs. firmware, for each machine on a synth track: random notes on and off, knob moves through the CPU model (Portamento included), raw control words anywhere from 0 to $7FFFFF (also for the AMP page and the trig word), tempos from 30 to 300 BPM; 400,000 blocks each, 18,000 to 36,000 of them mid-glide per 50,000 | every machine output sample identical; every machine state word identical after every block; the AMP envelope's state, its gain ramps and its products with the firmware's own filter output identical in every block; the glide's state, the pitch index (glide and TUNE) and the frequency word identical to the kernel's in every block |
+| Built plug-in code vs. firmware, with the firmware's filter output replaced by the machine's output × 0.4455 as in the plug-in: knob moves on both pages (Portamento included) through the CPU model, modulation, overlapping notes, tempo changes (240,000 blocks per plug-in: 24,062 moves, 2,463 of them modulation; 5,919 notes on and 4,834 off) | every output sample identical |
 | Tables vs. firmware memory | identical, every entry the machines and the AMP section read |
 
 The tables: the sine is the boot code's recurrence, reproduced exactly (the
@@ -145,8 +151,10 @@ entries one LSB lower in the firmware; Tone's one-pole coefficients are the
 machines' shared formula for 10 Hz × 2000^(k/128), with three entries
 corrected (as in [Mono Reverb](https://github.com/nerazin/mono-reverb-clap));
 the 24 ratios follow a rule; the attack steps are 0.5 × e^(−0.08354855518 k),
-rounded to six decimals and then to 24 bits; and the decay factors are
-10^(−3/64 × e^(−0.06730291836 k)), with 127 holding.
+rounded to six decimals and then to 24 bits; the decay factors are
+10^(−3/64 × e^(−0.06730291836 k)), with 127 holding; and the portamento
+speeds are 2^30 / (14400 × 2^(13k/128)), with 0 marked negative for the
+instant glide.
 
 `tests/test_core.c` pins this without the firmware. Its expected hashes were
 produced by feeding the same stimulus into the firmware's machines and AMP
@@ -178,16 +186,19 @@ xcrun clang -std=c11 -O2 -Wno-unused-function -Wno-missing-field-initializers -I
 AMP output against the firmware-derived hashes. `clap_test` loads the built
 bundle and checks:
 
-- the three plug-ins, each with its fourteen parameters;
+- the three plug-ins, each with its fifteen parameters;
 - at 44.1 kHz, each plug-in's output equal to the core's, for notes on and
-  off at and between control frames;
+  off at and between control frames, with Portamento at 0 and at 50 (and
+  that 50 glides);
 - FM+ STAT as a plain carrier at the core's frequency for A4 at 44.1 and
   48 kHz, and 197 cents higher with Tune at 127;
 - releasing the newer of two held notes returning to the other, and the
   release ending in silence;
 - a note's onset no earlier than the reported latency and at most one
   control frame and one block later, at 22.05, 44.1, 48 and 96 kHz;
-- state (also another machine's state rejected) and the parameter text.
+- state (also another machine's state rejected, and a state saved by 0.1.0,
+  from before Portamento, loaded with Portamento at 0) and the parameter
+  text.
 
 Both tests also pass with AddressSanitizer and UndefinedBehaviorSanitizer,
 and as Intel builds under Rosetta. The bundle passes clap-trap's `validate`

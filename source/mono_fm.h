@@ -85,6 +85,7 @@ static int32_t mf_tone[128];      /* the one-pole coefficient by TONE, 10 Hz x 2
 static int32_t mf_ratio[24];      /* the operators' frequency ratios to the carrier by xFRQ, x 2^20 (1/64 .. 4) */
 static int32_t mf_attack[128];    /* the AMP envelope's rise per block by ATK */
 static int32_t mf_decay[129];     /* minus its fall per block by DEC and REL (and the machines' envelopes) */
+static int32_t mf_port[128];      /* the glide's speed by PORT, per tick */
 
 /* Entries of mf_exp where the firmware's table is one LSB below the formula. */
 static const uint32_t mf_exp_low[64] = {
@@ -135,26 +136,34 @@ static void mf_tables(void) {
       mf_decay[k] = -(int32_t)floor(8388608.0 * pow(10.0, -3.0 / 64 * exp(-0.06730291836 * k)) + 0.5);
    mf_decay[127] = -MF_ONE - 1;
    mf_decay[128] = 1;
+   /* portamento: 2^30 / (14400 x 2^(13k/128)); 0 is a negative mark, a glide of two blocks */
+   mf_port[0] = -0x12345;
+   for (int k = 1; k < 128; ++k) mf_port[k] = (int32_t)floor(1073741824.0 / 14400.0 / exp2(13.0 * k / 128.0) + 0.5);
 }
 
 /* ---- the kernel: pitch ------------------------------------------------------ */
 
 /* The kernel's pitch glide, from the track's note word ((note << 11) / 12,
  * sent with every control frame) to the pitch index for each block, with
- * TUNE (the eighth SYN word: +-2 semitones). With the portamento at 0 a new
- * note is reached in two blocks: 127/128 of the way, then the rest. */
+ * TUNE (the eighth SYN word: +-2 semitones). The glide is linear, at a speed
+ * set by PORT (the AMP page's eighth word) times the tick (block word 42,
+ * 24 x BPM), so its length is in beats: about 0.0036 x 2^(13 PORT/128)
+ * beats for the whole way. With PORT at 0 a new note is reached in two
+ * blocks: 127/128 of the way, then the rest. */
 typedef struct { mf_acc now; int32_t start, target; } MfPitch;
 
 static void mf_pitch_reset(MfPitch *g, int32_t word) { g->now = mf_w(word); g->start = g->target = word; }
 
-static int32_t mf_pitch(MfPitch *g, int32_t word, int32_t tune) {
+static int32_t mf_pitch(MfPitch *g, int32_t word, int32_t tune, int32_t port, int32_t tick) {
    if (word != g->target) {   /* a glide still under way restarts from where it is */
       const int32_t now = mf_hi(g->now);
       if ((word < now && g->target >= now) || (word >= now && g->target < now)) g->start = g->target;
       g->target = word;
    }
+   const mf_acc r = mf_mpy(mf_port[(port >> 16) & 0x7f], tick);
+   const int32_t rate = r < 0 ? 0x7f0000 : (int32_t)((uint32_t)(r >> 8) << 8) >> 8;   /* a0 after ASR 8, as a signed word */
    const mf_acc dist = mf_w(g->target) - mf_w(g->start);
-   mf_acc a = g->now + mf_mpy(mf_sat(dist), 0x7f0000);
+   mf_acc a = g->now + mf_mpy(mf_sat(dist), rate);
    if (dist >= 0 ? a > mf_w(g->target) : a < mf_w(g->target)) { g->start = g->target; a = mf_w(g->target); }
    g->now = mf_raw(a);
    const mf_acc p = a + mf_w(-1) + mf_mpy(0x2ab, tune);   /* master tune at 440 Hz, and TUNE (341.5 at 64) */

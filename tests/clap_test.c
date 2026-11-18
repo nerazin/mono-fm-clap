@@ -20,7 +20,8 @@
 
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); puts(""); exit(1); } } while (0)
 #define N (192 * 512)   /* whole process calls */
-#define NP 14
+#define NP 15
+#define PORT 14
 #define MAXEV 16
 
 typedef union { clap_event_header_t h; clap_event_param_value_t v; clap_event_note_t n; clap_event_midi_t m; } Event;
@@ -82,7 +83,7 @@ static double frequency(double out[2][N], int from, int to, double rate) {
 static double note_hz(int note) {
    MfPitch g;
    mf_pitch_reset(&g, (note << 11) / 12);
-   return (double)mf_sat48(mf_dmul(0x0be37c, mf_freq(mf_pitch(&g, (note << 11) / 12, 64 << 16)))) / 137438953472.0 * 88200;
+   return (double)mf_sat48(mf_dmul(0x0be37c, mf_freq(mf_pitch(&g, (note << 11) / 12, 64 << 16, 0, 2880)))) / 137438953472.0 * 88200;
 }
 static double peak(double out[2][N], int from, int to) {
    double x = 0;
@@ -104,13 +105,17 @@ int main(int argc, char **argv) {
    CHECK(factory && factory->get_plugin_count(factory) == 3, "three plug-ins");
    for (uint32_t m = 0; m < 3; ++m) CHECK(!strcmp(factory->get_plugin_descriptor(factory, m)->id, ids[m]), "descriptor %u", m);
    mf_tables();
-   const double defaults[NP] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
+   const double defaults[NP] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
 
-   /* exact against the core at 44.1 kHz: notes on and off at and between control frames */
+   /* exact against the core at 44.1 kHz: notes on and off at and between control frames, without and with portamento */
    static const Note seq[] = {{100, 1, 48}, {6000, 0, 48}, {9000, 1, 67}, {9047, 1, 30}, {15000, 0, 67}, {20000, 0, 30}, {30001, 1, 90}, {60000, 0, 90}, {70000, 1, 60}};
    const int nseq = (int)(sizeof seq / sizeof seq[0]);
-   for (int m = 0; m < 3; ++m) {
-      const clap_plugin_t *p = make(m, defaults, 44100);
+   for (int t = 0; t < 6; ++t) {
+      const int m = t % 3;
+      double v[NP];
+      memcpy(v, defaults, sizeof v);
+      if (t >= 3) v[PORT] = 50;   /* about 170 blocks at 120 BPM */
+      const clap_plugin_t *p = make(m, v, 44100);
       CHECK(latency_of(p) == 0, "latency at 44.1 kHz");
       const clap_plugin_params_t *params = p->get_extension(p, CLAP_EXT_PARAMS);
       CHECK(params->count(p) == NP, "parameter count");
@@ -120,14 +125,16 @@ int main(int argc, char **argv) {
          CHECK(params->get_info(p, i, &info), "info");
          const int32_t w = (int32_t)info.default_value << 16;
          if (i < 8) syn[i] = w;
-         else amp[(const int[]){MF_ATK, MF_HOLD, MF_DEC, MF_REL, MF_VOL, MF_PAN}[i - 8]] = w;
+         else amp[(const int[]){MF_ATK, MF_HOLD, MF_DEC, MF_REL, MF_VOL, MF_PAN, MF_PORT}[i - 8]] = w;
       }
       run(p, seq, nseq, out);
       done(p);
       static MonoFm f;
       MfAmp env = {3, 0, 0, {0, 0}};
       MfPitch glide;
+      int32_t from = 0, mid = 0;
       mf_init(&f, m);
+      if (t >= 3) amp[MF_PORT] = 50 << 16;
       mf_pitch_reset(&glide, (60 << 11) / 12);
       for (int b = 0; b < N / MF_FRAMES; ++b) {
          for (; k < nseq && seq[k].at <= b * MF_FRAMES; ++k)   /* no release here falls back to a note still held */
@@ -136,12 +143,16 @@ int main(int argc, char **argv) {
          int trig = 0;
          if (b % 3 == 0) { trig = b ? (pending == 1 ? 0x81 : pending == 2 ? 0x02 : 0) : 0x80 | (pending == 1 ? 0x81 : 0); pending = 0; word = (note << 11) / 12; }
          int32_t y[MF_FRAMES], g[2][MF_FRAMES];
-         mf_block(&f, syn, mf_pitch(&glide, word, syn[7]), trig & 0x80, y);
+         const int32_t pitch = mf_pitch(&glide, word, syn[7], amp[MF_PORT], 2880);
+         if (b == 30001 / MF_FRAMES + 3 + 60) mid = pitch;   /* 60 blocks into the glide from 30 to 90 */
+         if (b == 30001 / MF_FRAMES - 3) from = pitch;
+         mf_block(&f, syn, pitch, trig & 0x80, y);
          mf_amp(&env, trig & 0x7f, amp, 0x800000 / 2880, g);
          for (int c = 0; c < 2; ++c)
             for (int i = 0; i < MF_FRAMES; ++i) bad += out[c][b * MF_FRAMES + i] != mf_apply(g[c][i], mf_mpy(y[i], 0x3905a5)) / 8388608.0;
       }
-      CHECK(bad == 0, "machine %d: %d frames differ from the core", m, bad);
+      CHECK(bad == 0, "machine %d, PORT %g: %d frames differ from the core", m, v[PORT], bad);
+      CHECK(t < 3 || (mid > from + 100 && mid < from + (60 << 11) / 12 - 100), "PORT 50 does not glide (%d from %d)", mid, from);
       CHECK(peak(out, 0, N) > 0.05, "machine %d is silent", m);
    }
 
@@ -216,6 +227,10 @@ int main(int argc, char **argv) {
       for (uint32_t i = 0; i < NP; ++i) { double x; CHECK(pp->get_value(q, i, &x) && x == v[i], "restored value %u", i); }
       b.pos = 0;
       CHECK(!((const clap_plugin_state_t *)other->get_extension(other, CLAP_EXT_STATE))->load(other, &is), "another machine's state accepted");
+      b.pos = 0; b.data[7] = 1; b.size = 8 + 8 * (NP - 1);   /* a version 1 state, from before PORT */
+      CHECK(((const clap_plugin_state_t *)q->get_extension(q, CLAP_EXT_STATE))->load(q, &is), "version 1 state");
+      for (uint32_t i = 0; i < NP; ++i) { double x; CHECK(pp->get_value(q, i, &x) && x == (i == PORT ? 0 : v[i]), "version 1 value %u", i); }
+      b.pos = 0; b.data[7] = 2; b.size = 8 + 8 * NP;
       b.pos = 0; b.data[8] ^= 0xff; b.data[15] = 0x7f;
       CHECK(!st->load(p, &is), "bad value accepted");
       char text[64];
